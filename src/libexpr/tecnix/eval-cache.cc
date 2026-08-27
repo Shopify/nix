@@ -86,7 +86,8 @@ struct TecnixEvalCache
     {
         auto state(_state.lock());
 
-        auto dbPath = getCacheDir() / "tecnix-eval-cache-v1.sqlite";
+        // v2: target candidates carry the evaluated drvPath as their payload.
+        auto dbPath = getCacheDir() / "tecnix-eval-cache-v2.sqlite";
         createDirs(dbPath.parent_path());
 
         state->db = SQLite(dbPath, {.useWAL = settings.useSQLiteWAL});

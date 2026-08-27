@@ -849,9 +849,11 @@ expectStderr 0 nix eval --json --verbose \
     --expr "$cache_expr" \
     | grepQuiet "tecnixTargets dependencies: dependency cache hit for '//areas/app/web:alpha'"
 
-# A dependency-cache hit is not a target-value cache hit: with includeTargets
-# (the default), a warm invocation must still resolve fresh target values while
-# reusing the cached dependency closures, sequentially and in parallel.
+# A dependency-cache hit becomes a target-value hit only when the candidate's
+# stored drvPath is still a valid store path. This fixture's drvPaths are
+# placeholders that are never valid, so a warm invocation with includeTargets
+# (the default) must fall back to resolving fresh target values while reusing
+# the cached dependency closures, sequentially and in parallel.
 echo "Testing target values alongside a dependency cache hit..."
 warm_values_system="cache-values-system-$$"
 warm_values_expr=$(rewrite_tecnix_test_expr "builtins.tecnixTargets (($base_args) // { args = { system = \"$warm_values_system\"; }; targets = [ \"//areas/app/web:alpha\" \"//areas/app/web:beta\" ]; includeDependencies = true; })")
@@ -1006,6 +1008,18 @@ tecnix_eval_json_cache() {
         --expr "$expr"
 }
 
+tecnix_eval_json_cache_parallel() {
+    local expr
+    expr=$(rewrite_tecnix_test_expr "$1")
+    XDG_CACHE_HOME="$EVAL_CACHE_HOME" nix eval --json -v \
+        --extra-experimental-features 'nix-command parallel-eval' \
+        --eval-cores 2 \
+        --option lazy-trees true \
+        --option tecnix-eval-cache true \
+        --pure-eval \
+        --expr "$expr"
+}
+
 CACHE_WORLD="$TEST_ROOT/tecnix-cache-world"
 createGitRepo "$CACHE_WORLD"
 (
@@ -1033,12 +1047,147 @@ warm_deps=$(tecnix_eval_json_cache "tecnixTargetDependencyPathSet (($cache_args)
 assert_json_equal "$warm_deps" "$cold_deps" "warm dependency query should equal cold"
 assert_jq "$warm_deps" '.alpha | has("deps/alpha.txt")' "cached dependency sets should contain the per-target dep"
 grepQuiet "dependency cache hit" "$TEST_ROOT/cache-warm.err"
-test -f "$EVAL_CACHE_HOME/nix/tecnix-eval-cache-v1.sqlite"
+test -f "$EVAL_CACHE_HOME/nix/tecnix-eval-cache-v2.sqlite"
 
 cold_names=$(tecnix_eval_json_cache "builtins.tecnixTargetNames ($cache_args)" 2> /dev/null)
 warm_names=$(tecnix_eval_json_cache "builtins.tecnixTargetNames ($cache_args)" 2> "$TEST_ROOT/cache-warm-names.err")
 assert_json_equal "$warm_names" "$cold_names" "warm discovery should equal cold"
 grepQuiet "discovery cache hit" "$TEST_ROOT/cache-warm-names.err"
+
+# This fixture's drvPaths are placeholder strings, not valid store paths, so
+# proven closure candidates must never serve cached target values: when values
+# are wanted, such a hit is an ordinary miss and the target is re-evaluated.
+echo "Testing cached target values decline invalid drv payloads..."
+fake_drv_targets=$(tecnix_eval_json_cache "builtins.tecnixTargets (($cache_args) // { targets = [ \"alpha\" \"beta\" ]; })" 2> "$TEST_ROOT/cache-fake-drv.err")
+grepQuiet "tecnixTargets dependencies: dependency cache hit for 'alpha' has no valid target value, evaluating" "$TEST_ROOT/cache-fake-drv.err"
+grepQuiet "tecnixTargets dependencies: dependency cache hit for 'beta' has no valid target value, evaluating" "$TEST_ROOT/cache-fake-drv.err"
+grepQuietInverse "served from the cache" "$TEST_ROOT/cache-fake-drv.err"
+assert_jq "$fake_drv_targets" '.alpha.drvPath | startswith("/nix/store/00000000000000000000000000000000-")' \
+    "invalid cached drv payloads should re-evaluate the target value"
+
+# ============================================================
+# Eval cache: target-value (drvPath payload) roundtrip
+# ============================================================
+# A proven closure candidate carries the drvPath its evaluation produced. When
+# that drv is still a valid store path, plain tecnixTargets answers from the
+# cache without calling the resolver; when the drv has been deleted, the
+# target value is re-evaluated (and the drv re-instantiated).
+
+echo "Testing cached target values (drvPath payload)..."
+
+DRV_WORLD="$TEST_ROOT/tecnix-drv-world"
+createGitRepo "$DRV_WORLD"
+(
+    cd "$DRV_WORLD"
+    mkdir deps
+    echo "echo alpha" > deps/alpha.txt
+    echo "echo beta" > deps/beta.txt
+    # The trace proves whether the resolver was evaluated at all: fully warm
+    # runs must answer from the cache without importing or applying it.
+    cat > resolve.nix << 'RESOLVE_EOF'
+args: builtins.trace "drv-world-resolver-evaluated" {
+  allTargetNames = [ "alpha" "beta" ];
+  resolve = id: derivation {
+    name = "drv-world-${id}";
+    system = "test-system";
+    builder = "/bin/sh";
+    args = [ "-c" (builtins.readFile (./deps + "/${id}.txt")) ];
+  };
+}
+RESOLVE_EOF
+    git add -A
+    git commit -m "drv world"
+)
+DRV_HEAD=$(get_head_sha "$DRV_WORLD")
+
+drv_args="{ gitDir = \"$DRV_WORLD/.git\"; resolver = \"resolve.nix\"; args = { system = \"test-system\"; }; rev = \"$DRV_HEAD\"; }"
+drv_paths_expr="builtins.mapAttrs (id: t: t.drvPath) (builtins.tecnixTargets (($drv_args) // { targets = [ \"alpha\" \"beta\" ]; }))"
+
+cold_drv_values=$(tecnix_eval_json_cache "$drv_paths_expr" 2> "$TEST_ROOT/drv-values-cold.err")
+grepQuiet "tecnixTargets dependencies: dependency cache miss, evaluating 'alpha'" "$TEST_ROOT/drv-values-cold.err"
+assert_jq "$cold_drv_values" '(.alpha | endswith("-drv-world-alpha.drv")) and (.beta | endswith("-drv-world-beta.drv"))' \
+    "cold tecnixTargets should instantiate real derivations"
+
+warm_drv_values=$(tecnix_eval_json_cache "$drv_paths_expr" 2> "$TEST_ROOT/drv-values-warm.err")
+assert_json_equal "$warm_drv_values" "$cold_drv_values" "warm cached target values should equal cold"
+grepQuiet "tecnixTargets dependencies: dependency cache hit for 'alpha'" "$TEST_ROOT/drv-values-warm.err"
+grepQuiet "tecnixTargets dependencies: dependency cache hit for 'beta'" "$TEST_ROOT/drv-values-warm.err"
+grepQuiet "tecnixTargets: 2 target value(s) served from the cache" "$TEST_ROOT/drv-values-warm.err"
+
+# Cached values also serve the includeDependencies + includeTargets shape.
+# (In --json a derivation-shaped value serializes as its outPath string.)
+warm_drv_records=$(tecnix_eval_json_cache "builtins.tecnixTargets (($drv_args) // { targets = [ \"alpha\" \"beta\" ]; includeDependencies = true; })" 2> "$TEST_ROOT/drv-records-warm.err")
+grepQuiet "tecnixTargets: 2 target value(s) served from the cache" "$TEST_ROOT/drv-records-warm.err"
+assert_jq "$warm_drv_records" '(.[0].value | endswith("-drv-world-alpha")) and (.[0].dependencies | has("deps/alpha.txt")) and (.[1].value | endswith("-drv-world-beta")) and (.[1].dependencies | has("deps/beta.txt"))' \
+    "cached target values should serve dependency records too"
+
+# A garbage-collected drv must not serve a cached value: that hit is an
+# ordinary miss, and re-evaluation re-instantiates the drv for the next run.
+echo "Testing cached target value fallback after drv deletion..."
+alpha_drv=$(jq -r '.alpha' <<< "$cold_drv_values")
+nix-store --delete "$alpha_drv" --ignore-liveness
+fallback_drv_values=$(tecnix_eval_json_cache "$drv_paths_expr" 2> "$TEST_ROOT/drv-values-fallback.err")
+assert_json_equal "$fallback_drv_values" "$cold_drv_values" "fallback re-evaluation should reproduce the deleted drv"
+grepQuiet "tecnixTargets dependencies: dependency cache hit for 'alpha' has no valid target value, evaluating" "$TEST_ROOT/drv-values-fallback.err"
+grepQuiet "tecnixTargets: 1 target value(s) served from the cache" "$TEST_ROOT/drv-values-fallback.err"
+rewarmed_drv_values=$(tecnix_eval_json_cache "$drv_paths_expr" 2> "$TEST_ROOT/drv-values-rewarmed.err")
+assert_json_equal "$rewarmed_drv_values" "$cold_drv_values" "re-instantiated drv should serve cached values again"
+grepQuiet "tecnixTargets: 2 target value(s) served from the cache" "$TEST_ROOT/drv-values-rewarmed.err"
+
+# ============================================================
+# Eval cache: the production reporting invocation
+# ============================================================
+# The production shape: discover target names (with a different `args` than
+# target resolution, so discovery lives under its own cache scope), feed the
+# names into plain tecnixTargets, and report each target's drvPath. A warm run
+# must be answered entirely from the cache: discovery hit, target-value hits,
+# and no resolver evaluation at all.
+
+echo "Testing the discovery-to-drvPath reporting invocation..."
+
+drv_report_expr="let
+  baseArgs = $drv_args;
+  discoveryArgs = baseArgs // { args = baseArgs.args // { filter = \"all\"; }; };
+  targets = builtins.tecnixTargetNames discoveryArgs;
+  resolved = builtins.tecnixTargets (baseArgs // { inherit targets; });
+in map (t: { target = t; drvPath = (builtins.getAttr t resolved).drvPath; }) targets"
+
+# First run: discovery misses (new args scope) and evaluates the resolver, but
+# target values are already cached from the runs above.
+cold_report=$(tecnix_eval_json_cache "$drv_report_expr" 2> "$TEST_ROOT/drv-report-cold.err")
+grepQuiet "tecnixTargetNames: discovery cache miss, evaluating" "$TEST_ROOT/drv-report-cold.err"
+grepQuiet "drv-world-resolver-evaluated" "$TEST_ROOT/drv-report-cold.err"
+grepQuiet "tecnixTargets: 2 target value(s) served from the cache" "$TEST_ROOT/drv-report-cold.err"
+assert_jq "$cold_report" 'length == 2 and .[0].target == "alpha" and (.[0].drvPath | endswith("-drv-world-alpha.drv")) and .[1].target == "beta" and (.[1].drvPath | endswith("-drv-world-beta.drv"))' \
+    "the reporting invocation should produce target/drvPath records"
+
+# Warm run: everything is served from the cache and the resolver never runs.
+warm_report=$(tecnix_eval_json_cache "$drv_report_expr" 2> "$TEST_ROOT/drv-report-warm.err")
+assert_json_equal "$warm_report" "$cold_report" "warm reporting invocation should equal cold"
+grepQuiet "tecnixTargetNames: discovery cache hit" "$TEST_ROOT/drv-report-warm.err"
+grepQuiet "tecnixTargets: 2 target value(s) served from the cache" "$TEST_ROOT/drv-report-warm.err"
+grepQuietInverse "dependency cache miss" "$TEST_ROOT/drv-report-warm.err"
+grepQuietInverse "drv-world-resolver-evaluated" "$TEST_ROOT/drv-report-warm.err"
+
+# The same warm invocation under the parallel evaluator (the production flags
+# include --eval-cores with parallel-eval) must behave identically.
+warm_report_parallel=$(tecnix_eval_json_cache_parallel "$drv_report_expr" 2> "$TEST_ROOT/drv-report-warm-parallel.err")
+assert_json_equal "$warm_report_parallel" "$cold_report" "parallel warm reporting invocation should equal cold"
+grepQuiet "tecnixTargetNames: discovery cache hit" "$TEST_ROOT/drv-report-warm-parallel.err"
+grepQuiet "tecnixTargets: 2 target value(s) served from the cache" "$TEST_ROOT/drv-report-warm-parallel.err"
+grepQuietInverse "drv-world-resolver-evaluated" "$TEST_ROOT/drv-report-warm-parallel.err"
+
+# Dependency-only queries store value payloads too: a dependency pass (CI
+# warming the cache) is enough for a later plain tecnixTargets call in the
+# same scope to be answered without evaluating anything.
+echo "Testing dependency-only warmup serves later target values..."
+deps_first_args="{ gitDir = \"$DRV_WORLD/.git\"; resolver = \"resolve.nix\"; args = { system = \"test-system\"; mode = \"deps-first\"; }; rev = \"$DRV_HEAD\"; }"
+tecnix_eval_json_cache "tecnixTargetDependencyPathSet (($deps_first_args) // { targets = [ \"alpha\" \"beta\" ]; })" > /dev/null 2> "$TEST_ROOT/deps-first-cold.err"
+grepQuiet "tecnixTargets dependencies: dependency cache miss, evaluating 'alpha'" "$TEST_ROOT/deps-first-cold.err"
+deps_first_values=$(tecnix_eval_json_cache "builtins.mapAttrs (id: t: t.drvPath) (builtins.tecnixTargets (($deps_first_args) // { targets = [ \"alpha\" \"beta\" ]; }))" 2> "$TEST_ROOT/deps-first-warm.err")
+assert_json_equal "$deps_first_values" "$cold_drv_values" "dependency-warmed target values should equal directly evaluated values"
+grepQuiet "tecnixTargets: 2 target value(s) served from the cache" "$TEST_ROOT/deps-first-warm.err"
+grepQuietInverse "drv-world-resolver-evaluated" "$TEST_ROOT/deps-first-warm.err"
 
 # ============================================================
 # Raw-tree contract: git attributes do not filter the Tecnix view

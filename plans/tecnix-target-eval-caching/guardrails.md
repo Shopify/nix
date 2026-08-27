@@ -92,8 +92,10 @@ Use this as a review checklist for source-dependency tracking and target-eval ca
 - **Dependency-only queries must not force target values.**
   - Continue to support `includeDependencies = true; includeTargets = false;`.
 
-- **A dependency-cache hit is not a target-value cache hit.**
-  - If callers ask for target values, those values still need evaluation unless a separate value-cache proof exists.
+- **A target-value cache hit needs the closure proof plus the drv.**
+  - A proven candidate may carry the evaluated target's `drvPath` as its payload.
+  - Reusing it requires that same complete closure proof plus the drv still being a valid store path; when target values are requested, anything else (no payload, malformed payload, garbage-collected drv) is an ordinary miss and re-evaluates.
+  - Cached target values are derivation-shaped (the `import <drvPath>` surface: `type`, `name`, `drvPath`, `outPath`, `outputs`, per-output attrs); resolver attributes outside that contract are not preserved on a value hit and must not be relied on.
 
 - **Keep legacy `unsafeTectonixInternal*` compatibility isolated from the new Tecnix cache/history design.**
 
