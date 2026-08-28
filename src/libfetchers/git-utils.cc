@@ -137,9 +137,9 @@ static void initLibGit2()
         // Register support for additional git extensions.
         // This allows opening repos with extensions that libgit2 doesn't natively support,
         // as long as we don't actually need the extension's functionality.
-        // "refstorage" is used by reftables - we can ignore it since we only access objects by SHA.
-        const char * extensions[] = {"refstorage"};
-        git_libgit2_opts(GIT_OPT_SET_EXTENSIONS, extensions, 1);
+        // "refstorage" is used by reftables; both extensions are safe to ignore when accessing objects by SHA.
+        const char * extensions[] = {"refstorage", "shopifypatchedgit"};
+        git_libgit2_opts(GIT_OPT_SET_EXTENSIONS, extensions, 2);
     });
 }
 

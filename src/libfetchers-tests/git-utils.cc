@@ -1,5 +1,6 @@
 #include "nix/fetchers/git-utils.hh"
 #include "nix/util/file-system.hh"
+#include <git2/config.h>
 #include <gmock/gmock.h>
 #include <git2/global.h>
 #include <git2/repository.h>
@@ -64,6 +65,21 @@ void writeString(CreateRegularFileSink & fileSink, std::string contents, bool ex
         fileSink.isExecutable();
     fileSink.preallocateContents(contents.size());
     fileSink(contents);
+}
+
+TEST_F(GitUtilsTest, opens_shopify_patched_git_repository)
+{
+    git_repository * rawRepo = nullptr;
+    ASSERT_EQ(git_repository_open(&rawRepo, tmpDir.string().c_str()), 0);
+
+    git_config * config = nullptr;
+    ASSERT_EQ(git_repository_config(&config, rawRepo), 0);
+    ASSERT_EQ(git_config_set_int32(config, "core.repositoryformatversion", 1), 0);
+    ASSERT_EQ(git_config_set_bool(config, "extensions.shopifyPatchedGit", true), 0);
+    git_config_free(config);
+    git_repository_free(rawRepo);
+
+    ASSERT_NO_THROW(openRepo());
 }
 
 TEST_F(GitUtilsTest, sink_basic)
