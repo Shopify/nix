@@ -30,6 +30,10 @@ uint32_t * tecnixInstallValueLabelChunk(size_t dirIndex)
 {
     static_assert(sizeof(void *) == 8, "the Tecnix value-label table requires a 64-bit address space");
 
+    /* Published before the chunk pointer, and therefore before the label store
+       that this chunk is being installed for: a reader that can observe any
+       label can also observe the flag. */
+
     size_t chunkBytes = (size_t{1} << 32) / 16 * sizeof(uint32_t);
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
 #ifdef MAP_NORESERVE
@@ -101,6 +105,43 @@ static uint64_t hashSourceAccessIds(std::span<const EvalSourceAccessId> items)
     return hash;
 }
 
+/* Hashes a canonical `internAccessSet` input. The direct ids and the child set
+   ids live in different id spaces, so they are separated by a marker that
+   cannot occur in either: without it `({a}, {})` and `({}, {a})` would collide
+   into the same bucket (harmless, but it would cost a chain walk on every
+   lookup). */
+static uint64_t hashAccessSetInputKey(
+    std::span<const EvalSourceAccessId> directAccesses, std::span<const EvalSourceAccessSetId> children)
+{
+    uint64_t hash = 1469598103934665603ULL;
+    auto mix = [&](uint64_t word) {
+        hash ^= word;
+        hash *= 1099511628211ULL;
+    };
+
+    for (auto access : directAccesses)
+        mix(access);
+    mix(~uint64_t{0});
+    for (auto child : children)
+        mix(child);
+    return hash;
+}
+
+/* Copies the non-empty ids of `in` into `out`, sorted and deduplicated, so that
+   frames which recorded the same ids in a different order (or more than once,
+   which the frame appenders only partially suppress) produce the same memo
+   key. */
+template<typename Id>
+static void canonicaliseAccessSetInput(std::vector<Id> & out, std::span<const Id> in)
+{
+    out.clear();
+    for (auto id : in)
+        if (id != 0)
+            out.push_back(id);
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+}
+
 EvalSourceAccessSetGraph::EvalSourceAccessSetGraph() = default;
 
 void EvalSourceAccessSetGraph::enable()
@@ -114,6 +155,7 @@ void EvalSourceAccessSetGraph::enable()
 
     accesses.emplace_back();
     accessSets.push_back(EvalSourceAccessSetNode{});
+    inputKeys.push_back(EvalSourceAccessSetInputNode{}); // index 0 is the "no entry" sentinel
     enabled.store(true, std::memory_order_release);
 }
 
@@ -153,40 +195,96 @@ bool EvalSourceAccessSetGraph::accessSetEquals(
         accessSetItems.begin() + node.first + node.count);
 }
 
+bool EvalSourceAccessSetGraph::inputKeyEquals(
+    uint32_t id,
+    std::span<const EvalSourceAccessId> directAccesses,
+    std::span<const EvalSourceAccessSetId> children) const
+{
+    auto node = inputKeys[id];
+    if (node.directCount != directAccesses.size() || node.childCount != children.size())
+        return false;
+
+    auto * items = inputKeyItems.data() + node.first;
+    return std::equal(directAccesses.begin(), directAccesses.end(), items)
+           && std::equal(children.begin(), children.end(), items + node.directCount);
+}
+
+EvalSourceAccessSetId EvalSourceAccessSetGraph::lookupInputKey(
+    uint64_t hash,
+    std::span<const EvalSourceAccessId> directAccesses,
+    std::span<const EvalSourceAccessSetId> children,
+    bool & found) const
+{
+    found = false;
+    auto head = inputKeyIdsByHash.find(hash);
+    if (head == inputKeyIdsByHash.end())
+        return emptyEvalSourceAccessSetId;
+
+    for (auto id = head->second; id != 0; id = inputKeys[id].nextWithSameHash) {
+        if (!inputKeyEquals(id, directAccesses, children))
+            continue;
+        found = true;
+        return inputKeys[id].accessSet;
+    }
+    return emptyEvalSourceAccessSetId;
+}
+
+void EvalSourceAccessSetGraph::rememberInputKey(
+    uint64_t hash,
+    std::span<const EvalSourceAccessId> directAccesses,
+    std::span<const EvalSourceAccessSetId> children,
+    EvalSourceAccessSetId accessSet)
+{
+    /* The memo is a pure accelerator: past the cap we simply stop adding
+       entries and fall back to flattening, rather than let a pathological
+       evaluation grow it without bound. */
+    constexpr size_t maxInputKeys = size_t{1} << 20;
+    if (inputKeys.size() >= maxInputKeys)
+        return;
+
+    auto first = static_cast<uint32_t>(inputKeyItems.size());
+    inputKeyItems.insert(inputKeyItems.end(), directAccesses.begin(), directAccesses.end());
+    inputKeyItems.insert(inputKeyItems.end(), children.begin(), children.end());
+
+    auto id = static_cast<uint32_t>(inputKeys.size());
+    uint32_t next = 0;
+    if (auto head = inputKeyIdsByHash.find(hash); head != inputKeyIdsByHash.end()) {
+        next = head->second;
+        head->second = id;
+    } else {
+        inputKeyIdsByHash.emplace(hash, id);
+    }
+    inputKeys.push_back(
+        EvalSourceAccessSetInputNode{
+            .first = first,
+            .directCount = static_cast<uint32_t>(directAccesses.size()),
+            .childCount = static_cast<uint32_t>(children.size()),
+            .nextWithSameHash = next,
+            .hash = hash,
+            .accessSet = accessSet,
+        });
+}
+
 EvalSourceAccessSetId EvalSourceAccessSetGraph::internAccessSet(
     std::span<const EvalSourceAccessId> directAccesses, std::span<const EvalSourceAccessSetId> children)
 {
     if (!enabled.load(std::memory_order_acquire))
         return emptyEvalSourceAccessSetId;
 
-    size_t directCount = 0;
-    EvalSourceAccessId singleDirect = emptyEvalSourceAccessId;
-    for (auto access : directAccesses) {
-        if (access == emptyEvalSourceAccessId)
-            continue;
-        directCount++;
-        singleDirect = access;
-    }
+    /* Canonicalise the input before anything else: it is what the memo below is
+       keyed on, and it is tiny (one frame's direct accesses and child edges)
+       compared to the transitive union those children stand for. */
+    static thread_local std::vector<EvalSourceAccessId> keyDirect;
+    static thread_local std::vector<EvalSourceAccessSetId> keyChildren;
+    canonicaliseAccessSetInput(keyDirect, directAccesses);
+    canonicaliseAccessSetInput(keyChildren, children);
 
-    size_t childCount = 0;
-    EvalSourceAccessSetId singleChild = emptyEvalSourceAccessSetId;
-    EvalSourceAccessSetId pairChildA = emptyEvalSourceAccessSetId;
-    EvalSourceAccessSetId pairChildB = emptyEvalSourceAccessSetId;
-    for (auto child : children) {
-        if (child == emptyEvalSourceAccessSetId)
-            continue;
-        childCount++;
-        singleChild = child;
-        if (childCount == 1)
-            pairChildA = child;
-        else if (childCount == 2)
-            pairChildB = child;
+    if (keyDirect.empty()) {
+        if (keyChildren.empty())
+            return emptyEvalSourceAccessSetId;
+        if (keyChildren.size() == 1)
+            return keyChildren.front();
     }
-
-    if (directCount == 0 && childCount == 0)
-        return emptyEvalSourceAccessSetId;
-    if (directCount == 0 && childCount == 1)
-        return singleChild;
 
     auto internSingleton = [&](EvalSourceAccessId access) {
         if (access == emptyEvalSourceAccessId)
@@ -206,38 +304,34 @@ EvalSourceAccessSetId EvalSourceAccessSetGraph::internAccessSet(
     };
 
     std::lock_guard lock(mutex);
-    if (childCount == 0 && directCount == 1)
-        return internSingleton(singleDirect);
+    if (keyChildren.empty() && keyDirect.size() == 1)
+        return internSingleton(keyDirect.front());
 
-    bool hasPairUnionKey = false;
-    uint64_t pairUnionKey = 0;
-    if (directCount == 0 && childCount == 2) {
-        auto a = std::min(pairChildA, pairChildB);
-        auto b = std::max(pairChildA, pairChildB);
-        if (a == b)
-            return a;
-        pairUnionKey = (uint64_t{a} << 32) | uint64_t{b};
-        if (auto existing = pairUnionAccessSets.find(pairUnionKey); existing != pairUnionAccessSets.end())
-            return existing->second;
-        hasPairUnionKey = true;
-    }
+    /* Memoise on the canonical input. Publishing the same input tuple over and
+       over is the normal case — the same thunks and imports are re-forced under
+       every target — and without this each repeat pays a full flatten, sort and
+       dedup of the transitive union just to discover, via `accessSetIdsByHash`,
+       that the resulting set already exists. The union is unbounded (sets here
+       average ~160 members and target roots are far larger); the input is a
+       handful of ids. */
+    auto inputKeyHash = hashAccessSetInputKey(keyDirect, keyChildren);
+    bool memoised = false;
+    if (auto existing = lookupInputKey(inputKeyHash, keyDirect, keyChildren, memoised); memoised)
+        return existing;
 
     static thread_local std::vector<EvalSourceAccessId> items;
 
     auto buildItems = [&] {
-        size_t itemCount = directCount;
-        for (auto child : children)
-            if (child != emptyEvalSourceAccessSetId && child < accessSets.size())
+        size_t itemCount = keyDirect.size();
+        for (auto child : keyChildren)
+            if (child < accessSets.size())
                 itemCount += accessSets[child].count;
 
         items.clear();
         items.reserve(itemCount);
-
-        for (auto access : directAccesses)
-            if (access != emptyEvalSourceAccessId)
-                items.push_back(access);
-        for (auto child : children) {
-            if (child == emptyEvalSourceAccessSetId || child >= accessSets.size())
+        items.insert(items.end(), keyDirect.begin(), keyDirect.end());
+        for (auto child : keyChildren) {
+            if (child >= accessSets.size())
                 continue;
             auto node = accessSets[child];
             items.insert(
@@ -258,13 +352,17 @@ EvalSourceAccessSetId EvalSourceAccessSetGraph::internAccessSet(
     };
 
     auto hash = buildItems();
-    if (items.empty())
+    if (items.empty()) {
+        rememberInputKey(inputKeyHash, keyDirect, keyChildren, emptyEvalSourceAccessSetId);
         return emptyEvalSourceAccessSetId;
-    if (items.size() == 1)
-        return internSingleton(items.front());
+    }
+    if (items.size() == 1) {
+        auto singleton = internSingleton(items.front());
+        rememberInputKey(inputKeyHash, keyDirect, keyChildren, singleton);
+        return singleton;
+    }
     if (auto existing = lookupAccessSet(hash); existing != emptyEvalSourceAccessSetId) {
-        if (hasPairUnionKey)
-            pairUnionAccessSets.emplace(pairUnionKey, existing);
+        rememberInputKey(inputKeyHash, keyDirect, keyChildren, existing);
         return existing;
     }
 
@@ -287,8 +385,7 @@ EvalSourceAccessSetId EvalSourceAccessSetGraph::internAccessSet(
             .nextWithSameHash = next,
             .hash = hash,
         });
-    if (hasPairUnionKey)
-        pairUnionAccessSets.emplace(pairUnionKey, id);
+    rememberInputKey(inputKeyHash, keyDirect, keyChildren, id);
     return id;
 }
 
@@ -372,19 +469,31 @@ EvalSourceAccessSetStats EvalSourceAccessSetGraph::stats() const
     };
 }
 
-/* Frames only suppress *consecutive* duplicates: `internAccessSet` sorts and
-   fully dedupes at publish time, so per-append deduplication would be
-   redundant work (and quadratic for large scope frames, e.g. the resolver
-   import scope). The consecutive check catches the common pattern of a loop
-   re-reading one path or re-forcing one value. */
+/* Frames suppress duplicates against a bounded window of recent appends rather
+   than against the whole frame: `internAccessSet` sorts and fully dedupes at
+   publish time, so exhaustive per-append deduplication would be redundant work
+   (and quadratic for large scope frames, e.g. the resolver import scope).
+
+   The window is deliberately wider than the last entry. Duplicates arrive
+   interleaved, not just consecutively — a loop that forces a handful of values
+   round-robin, or a scope that re-reads two or three paths in rotation, defeats
+   a size-1 check entirely. Every duplicate that survives into the frame inflates
+   the publish: a larger input to hash and compare, and, on a memo miss, more
+   member lists to concatenate and sort. Scanning a fixed window keeps the append
+   O(1) while collapsing the common patterns. */
+/* Duplicate suppression compares against the frame's own last entry only, never
+   against entries below its watermark: those belong to the parent, and skipping
+   a push because the *parent* already holds the id would leave this frame with
+   no dependencies of its own, so its value would be published without a label. */
 static void addFrameAccess(TrackedSourceDepsFrame & frame, EvalSourceAccessId access)
 {
     if (access == emptyEvalSourceAccessId)
         return;
 
-    auto size = frame.directSourceAccessSetAccesses.size();
-    if (size == 0 || frame.directSourceAccessSetAccesses.data()[size - 1] != access)
-        frame.directSourceAccessSetAccesses.push_back(access);
+    auto & ids = frame.trackingCtx.frameAccessStack;
+    if (ids.size() > frame.accessBase && ids.back() == access)
+        return;
+    ids.push_back(access);
 }
 
 static void addFrameChild(TrackedSourceDepsFrame & frame, EvalSourceAccessSetId child)
@@ -392,17 +501,10 @@ static void addFrameChild(TrackedSourceDepsFrame & frame, EvalSourceAccessSetId 
     if (child == emptyEvalSourceAccessSetId)
         return;
 
-    auto size = frame.childSourceAccessSets.size();
-    if (size == 0 || frame.childSourceAccessSets.data()[size - 1] != child)
-        frame.childSourceAccessSets.push_back(child);
-}
-
-static void addToParentFrame(TrackedSourceDepsFrame & parent, EvalSourceAccessSetId accessSet)
-{
-    if (accessSet == emptyEvalSourceAccessSetId)
+    auto & ids = frame.trackingCtx.frameChildStack;
+    if (ids.size() > frame.childBase && ids.back() == child)
         return;
-
-    addFrameChild(parent, accessSet);
+    ids.push_back(child);
 }
 
 static void addToCurrentFrame(TrackingContext & trackingCtx, EvalSourceAccessSetId accessSet)
@@ -420,7 +522,8 @@ static void addToCurrentFrame(TrackingContext & trackingCtx, EvalSourceAccessSet
 
 static bool frameHasSourceDeps(const TrackedSourceDepsFrame & frame)
 {
-    return !frame.directSourceAccessSetAccesses.empty() || !frame.childSourceAccessSets.empty();
+    return frame.trackingCtx.frameAccessStack.size() > frame.accessBase
+           || frame.trackingCtx.frameChildStack.size() > frame.childBase;
 }
 
 static EvalSourceAccessSetId internFrameAccessSet(TrackedSourceDepsFrame & frame)
@@ -429,27 +532,52 @@ static EvalSourceAccessSetId internFrameAccessSet(TrackedSourceDepsFrame & frame
         return emptyEvalSourceAccessSetId;
 
     return frame.trackingCtx.sourceAccessSetGraph->internAccessSet(
-        std::span<const EvalSourceAccessId>(
-            frame.directSourceAccessSetAccesses.data(), frame.directSourceAccessSetAccesses.size()),
-        std::span<const EvalSourceAccessSetId>(frame.childSourceAccessSets.data(), frame.childSourceAccessSets.size()));
+        frame.directSourceAccessSetAccesses(), frame.childSourceAccessSets());
 }
 
-static void mergeFrameIntoParent(TrackedSourceDepsFrame & frame)
+/* Truncate the frame's region and leave `accessSet` in its place, so the frame's
+   contribution to its parent is exactly the one interned id. Recording the marks
+   as the new bases lets frame teardown restore the stacks with a plain compare. */
+static void collapseFrameToAccessSet(TrackedSourceDepsFrame & frame, EvalSourceAccessSetId accessSet)
 {
-    auto * parent = frame.previous ? frame.previous : &frame.trackingCtx.rootFrame;
-    if (parent == &frame)
-        return;
+    auto & accesses = frame.trackingCtx.frameAccessStack;
+    auto & children = frame.trackingCtx.frameChildStack;
 
-    for (auto access : frame.directSourceAccessSetAccesses)
-        addFrameAccess(*parent, access);
-    for (auto child : frame.childSourceAccessSets)
-        addFrameChild(*parent, child);
+    if (accesses.size() > frame.accessBase)
+        accesses.resize(frame.accessBase);
+    if (children.size() > frame.childBase)
+        children.resize(frame.childBase);
+
+    if (accessSet != emptyEvalSourceAccessSetId) {
+        auto * parent = frame.previous ? frame.previous : &frame.trackingCtx.rootFrame;
+        if (parent != &frame)
+            addFrameChild(*parent, accessSet);
+        else
+            addFrameChild(frame, accessSet);
+    }
+
+    frame.accessBase = accesses.size();
+    frame.childBase = children.size();
 }
 
 void mergeUnpublishedTrackedSourceDepsFrame(TrackedSourceDepsFrame & frame)
 {
+    /* An unpublished frame needs no merge: its entries already sit contiguously
+       inside the parent's region, so leaving them in place is the merge.
+
+       A published frame has already been collapsed to its interned id, and its
+       bases moved past it. Anything recorded after the publish is discarded --
+       matching the copy-based implementation, where a published frame's entries
+       were simply never copied out. */
     if (!frame.published)
-        mergeFrameIntoParent(frame);
+        return;
+
+    auto & accesses = frame.trackingCtx.frameAccessStack;
+    auto & children = frame.trackingCtx.frameChildStack;
+    if (accesses.size() > frame.accessBase)
+        accesses.resize(frame.accessBase);
+    if (children.size() > frame.childBase)
+        children.resize(frame.childBase);
 }
 
 void recordTrackedSourceAccessSetAccess(EvalSourceAccessId access)
@@ -481,34 +609,24 @@ void publishTrackedValueDependencies(const void * value)
     if (!frame || frame->published)
         return;
 
-    auto directCount = frame->directSourceAccessSetAccesses.size();
-    auto childCount = frame->childSourceAccessSets.size();
+    auto directAccesses = frame->directSourceAccessSetAccesses();
+    auto children = frame->childSourceAccessSets();
 
-    if (!frameHasSourceDeps(*frame)) {
+    if (directAccesses.empty() && children.empty()) {
         frame->published = true;
         return;
     }
 
     EvalSourceAccessSetId sourceAccessSet = emptyEvalSourceAccessSetId;
-    if (directCount == 0 && childCount == 1) {
-        sourceAccessSet = frame->childSourceAccessSets.data()[0];
+    if (directAccesses.empty() && children.size() == 1) {
+        sourceAccessSet = children[0];
         if (sourceAccessSet != emptyEvalSourceAccessSetId)
             frame->value->setTrackedSourceAccessSet(sourceAccessSet);
     } else {
         sourceAccessSet = publishTrackedSourceAccessSetDependencies(
-            *frame->trackingCtx.sourceAccessSetGraph,
-            *frame->value,
-            std::span<const EvalSourceAccessId>(
-                frame->directSourceAccessSetAccesses.data(), frame->directSourceAccessSetAccesses.size()),
-            std::span<const EvalSourceAccessSetId>(
-                frame->childSourceAccessSets.data(), frame->childSourceAccessSets.size()));
+            *frame->trackingCtx.sourceAccessSetGraph, *frame->value, directAccesses, children);
     }
-    if (sourceAccessSet != emptyEvalSourceAccessSetId) {
-        if (frame->previous)
-            addToParentFrame(*frame->previous, sourceAccessSet);
-        else
-            addToCurrentFrame(frame->trackingCtx, sourceAccessSet);
-    }
+    collapseFrameToAccessSet(*frame, sourceAccessSet);
     frame->accessSet = sourceAccessSet;
     frame->published = true;
 }
@@ -557,10 +675,28 @@ void publishCopiedValueDependencies(void * dst, const void * src)
         std::span<const EvalSourceAccessSetId>(children));
 }
 
+std::span<const EvalSourceAccessId> TrackedSourceDepsFrame::directSourceAccessSetAccesses() const
+{
+    const auto & ids = trackingCtx.frameAccessStack;
+    if (ids.size() <= accessBase)
+        return {};
+    return {ids.data() + accessBase, ids.size() - accessBase};
+}
+
+std::span<const EvalSourceAccessSetId> TrackedSourceDepsFrame::childSourceAccessSets() const
+{
+    const auto & ids = trackingCtx.frameChildStack;
+    if (ids.size() <= childBase)
+        return {};
+    return {ids.data() + childBase, ids.size() - childBase};
+}
+
 TrackedSourceDepsFrame::TrackedSourceDepsFrame(
     TrackingContext & trackingCtx, Value * value, TrackedSourceDepsFrame * previous)
     : trackingCtx(trackingCtx)
     , value(value)
+    , accessBase(trackingCtx.frameAccessStack.size())
+    , childBase(trackingCtx.frameChildStack.size())
     , previous(previous)
     , nearestValueForceFrame(
           value      ? this
@@ -573,6 +709,12 @@ TrackingContext::TrackingContext(EvalState & evalState)
     : sourceAccessSetGraph(trackedSourceAccessSetGraph(evalState))
     , rootFrame(*this)
 {
+    /* Sized to hold a deep force chain without reallocating mid-evaluation;
+       frames hold indices, not pointers, so a reallocation would be correct,
+       just wasteful. */
+    frameAccessStack.reserve(4096);
+    frameChildStack.reserve(4096);
+
     // Establish the invariant every hot path relies on: a live TrackingContext
     // implies an enabled graph, so forcing and the value hooks never re-check.
     sourceAccessSetGraph->enable();
@@ -623,12 +765,7 @@ EvalSourceAccessSetId TrackedSourceDepsScope::finish(Value * publishValue)
         currentTecnixThreadState.sourceDepsFrame = previousFrame;
 
     frame.accessSet = internFrameAccessSet(frame);
-    if (frame.accessSet != emptyEvalSourceAccessSetId) {
-        if (frame.previous)
-            addToParentFrame(*frame.previous, frame.accessSet);
-        else
-            addToCurrentFrame(frame.trackingCtx, frame.accessSet);
-    }
+    collapseFrameToAccessSet(frame, frame.accessSet);
 
     if (publishValue && frame.accessSet != emptyEvalSourceAccessSetId)
         publishValue->setTrackedSourceAccessSet(frame.accessSet);

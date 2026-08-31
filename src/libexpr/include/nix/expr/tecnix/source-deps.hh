@@ -5,8 +5,6 @@
 #include "nix/util/pos-idx.hh"
 #include "nix/util/ref.hh"
 
-#include <boost/container/small_vector.hpp>
-
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -50,21 +48,35 @@ forceValueTracked(EvalState & state, Value & v, PosIdx pos, TrackingContext & tr
 
 std::vector<std::string> parseGitPorcelainZDirtyPaths(std::string_view output);
 
-using EvalSourceAccessIdFrameVector = boost::container::small_vector<EvalSourceAccessId, 1>;
-using EvalSourceAccessSetIdFrameVector = boost::container::small_vector<EvalSourceAccessSetId, 2>;
-
 /**
  * A stack-resident accumulator for one bracketed region of evaluation: the
  * force of one value (`value` set) or a source-deps scope / target root
  * (`value` null). Collects direct path accesses and inherited child labels;
  * interned into one set id when the region publishes.
+ *
+ * Frames are strictly LIFO within a tracking context, so their entries do not
+ * need per-frame containers: they live in two stacks owned by the context and
+ * a frame stores only the stack sizes at entry (its "watermarks"). A frame's
+ * entries are whatever sits above its marks.
+ *
+ * This makes the two operations that dominate tracked evaluation nearly free.
+ * Entering and leaving a region that records nothing -- the majority of forces
+ * -- costs two loads and two compares rather than constructing and destroying
+ * two containers. Merging an unpublished frame into its parent costs nothing
+ * at all, because the entries are already contiguous inside the parent's own
+ * region; leaving them in place *is* the merge. Publishing truncates back to
+ * the marks and pushes the single interned id in their place.
+ *
+ * The frame is trivially destructible, so it emits no destructor.
  */
 struct TrackedSourceDepsFrame
 {
     TrackingContext & trackingCtx;
     Value * value = nullptr;
-    EvalSourceAccessIdFrameVector directSourceAccessSetAccesses;
-    EvalSourceAccessSetIdFrameVector childSourceAccessSets;
+    /** Size of the context's access stack when this frame was entered. */
+    uint32_t accessBase = 0;
+    /** Size of the context's child stack when this frame was entered. */
+    uint32_t childBase = 0;
     EvalSourceAccessSetId accessSet = emptyEvalSourceAccessSetId;
     TrackedSourceDepsFrame * previous = nullptr;
     TrackedSourceDepsFrame * nearestValueForceFrame = nullptr;
@@ -72,6 +84,11 @@ struct TrackedSourceDepsFrame
 
     TrackedSourceDepsFrame(
         TrackingContext & trackingCtx, Value * value = nullptr, TrackedSourceDepsFrame * previous = nullptr);
+
+    /** The direct accesses recorded into this frame, as a view into the context stack. */
+    std::span<const EvalSourceAccessId> directSourceAccessSetAccesses() const;
+    /** The child labels recorded into this frame, as a view into the context stack. */
+    std::span<const EvalSourceAccessSetId> childSourceAccessSets() const;
 };
 
 /**
@@ -95,6 +112,12 @@ struct TrackedSourceDepsFrame
 struct TrackingContext
 {
     ref<EvalSourceAccessSetGraph> sourceAccessSetGraph;
+    /**
+     * Backing storage for every frame in this context. Declared before
+     * `rootFrame` so they are constructed before it reads their sizes.
+     */
+    std::vector<EvalSourceAccessId> frameAccessStack;
+    std::vector<EvalSourceAccessSetId> frameChildStack;
     TrackedSourceDepsFrame rootFrame;
 
     // Always captures the EvalState-owned source-access graph; no foreign graph constructor exists.

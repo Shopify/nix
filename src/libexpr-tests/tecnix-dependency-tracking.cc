@@ -46,9 +46,10 @@ static bool containsPath(const std::vector<std::string> & paths, std::string_vie
 static std::vector<std::string>
 flattenFrame(const ref<EvalSourceAccessSetGraph> & graph, const TrackedSourceDepsFrame & frame)
 {
-    std::vector<EvalSourceAccessId> direct(
-        frame.directSourceAccessSetAccesses.begin(), frame.directSourceAccessSetAccesses.end());
-    std::vector<EvalSourceAccessSetId> children(frame.childSourceAccessSets.begin(), frame.childSourceAccessSets.end());
+    auto frameAccesses = frame.directSourceAccessSetAccesses();
+    auto frameChildren = frame.childSourceAccessSets();
+    std::vector<EvalSourceAccessId> direct(frameAccesses.begin(), frameAccesses.end());
+    std::vector<EvalSourceAccessSetId> children(frameChildren.begin(), frameChildren.end());
     return graph->flatten(direct, children);
 }
 
