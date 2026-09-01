@@ -96,6 +96,8 @@ struct AllowListSourceAccessorImpl : AllowListSourceAccessor
     SharedSync<std::set<CanonPath>> allowedPrefixes;
     SharedSync<boost::unordered_flat_set<CanonPath>> allowedPaths;
 
+    SharedSync<boost::unordered_flat_set<CanonPath>> knownAllowed;
+
     AllowListSourceAccessorImpl(
         ref<SourceAccessor> next,
         std::set<CanonPath> && allowedPrefixes,
@@ -109,7 +111,15 @@ struct AllowListSourceAccessorImpl : AllowListSourceAccessor
 
     bool isAllowed(const CanonPath & path) override
     {
-        return allowedPaths.readLock()->contains(path) || path.isAllowed(*allowedPrefixes.readLock());
+        if (knownAllowed.readLock()->contains(path))
+            return true;
+        if (!(allowedPaths.readLock()->contains(path) || path.isAllowed(*allowedPrefixes.readLock())))
+            return false;
+        // Only cache allows since allow may be widened later by `allowPrefix` but not narrowed
+        // and `CanonPath::isAllowed` may do more expensive I/O for a hot path (and this struct
+        // cannot be inherited/overriden externally)
+        knownAllowed.lock()->insert(path);
+        return true;
     }
 
     void allowPrefix(CanonPath prefix) override

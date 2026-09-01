@@ -31,6 +31,22 @@ using EvalImportResolutionCache = boost::concurrent_flat_map<SourcePath, EvalImp
 using EvalFileCache = boost::concurrent_flat_map<SourcePath, RootValue>;
 using EvalWorldTreeShaCache = boost::concurrent_flat_map<std::string, Hash>;
 
+/**
+ * A resolver module applied to `args`, together with the source-access set
+ * recorded while applying it. The label has to be kept alongside the value:
+ * the accesses happen once, when the module is first built, but every tracking
+ * context that reuses the module must still record them, or the resolver file
+ * itself silently drops out of the dependency closure it is supposed to
+ * invalidate.
+ */
+struct EvalTecnixModuleCacheEntry
+{
+    RootValue value;
+    EvalSourceAccessSetId sourceDeps = emptyEvalSourceAccessSetId;
+};
+
+using EvalTecnixModuleCache = boost::concurrent_flat_map<std::string, EvalTecnixModuleCacheEntry>;
+
 struct EvalState::TecnixEvalData
 {
     /**
@@ -99,6 +115,28 @@ struct EvalState::TecnixEvalData
 
     /** Cache: world path → tree SHA (lazy computed, cached at each path level) */
     const ref<EvalWorldTreeShaCache> worldTreeShaCache = make_ref<EvalWorldTreeShaCache>();
+
+    /**
+     * The resolver module applied to `args`, keyed by resolver path and the
+     * canonical `args` encoding.
+     *
+     * Every Tecnix builtin needs the same thing: the resolver file imported and
+     * called with `args`. Importing is already cached, but the *application*
+     * was not, so each builtin got its own copy of the returned attrset and
+     * therefore its own unevaluated copy of everything hanging off it. A run
+     * that discovers target names and then resolves them consequently walked
+     * the zone graph twice, which measured as ~24% more thunks and function
+     * calls than resolving alone.
+     *
+     * `argsKey` is a canonical, injective encoding of `args` (see
+     * `canonicalJsonFromValue`), so an equal key means the resolver would be
+     * applied to an equal value and the result is interchangeable. Sharing the
+     * applied module across tracking contexts is sound for the same reason
+     * sharing `trackedFileEvalCache` is: whichever context first forces a thunk
+     * publishes its source-access label onto the finished value, and a later
+     * force in another context picks that label up via `forceValueTracked`.
+     */
+    const ref<EvalTecnixModuleCache> tecnixModuleCache = make_ref<EvalTecnixModuleCache>();
 
     /** Lazy-initialized set of zone IDs in sparse checkout (thread-safe via once_flag) */
     mutable std::once_flag tectonixSparseCheckoutRootsFlag;

@@ -6,20 +6,26 @@
 
 namespace nix {
 
+/**
+ * Canonicalise a candidate store path.
+ *
+ * On Windows, `/nix/store` is not a canonical path. More broadly it is unclear
+ * whether this function should be using the native notion of a canonical path
+ * at all. For example, it makes to support remote stores whose store dir is a
+ * non-native path (e.g. Windows <-> Unix ssh-ing).
+ */
+static std::filesystem::path canonicaliseStorePathCandidate(std::string_view path)
+{
+#ifdef _WIN32
+    return std::filesystem::path(path);
+#else
+    return canonPath(std::string(path));
+#endif
+}
+
 StorePath StoreDirConfig::parseStorePath(std::string_view path) const
 {
-    // On Windows, `/nix/store` is not a canonical path. More broadly it
-    // is unclear whether this function should be using the native
-    // notion of a canonical path at all. For example, it makes to
-    // support remote stores whose store dir is a non-native path (e.g.
-    // Windows <-> Unix ssh-ing).
-    auto p =
-#ifdef _WIN32
-        std::filesystem::path(path)
-#else
-        canonPath(std::string(path))
-#endif
-        ;
+    auto p = canonicaliseStorePathCandidate(path);
     if (p.parent_path() != storeDir)
         throw BadStorePath("path %s is not in the Nix store", PathFmt(p));
     return StorePath(p.filename().string());
@@ -28,7 +34,10 @@ StorePath StoreDirConfig::parseStorePath(std::string_view path) const
 std::optional<StorePath> StoreDirConfig::maybeParseStorePath(std::string_view path) const
 {
     try {
-        return parseStorePath(path);
+        auto p = canonicaliseStorePathCandidate(path);
+        if (p.parent_path() != storeDir)
+            return {};
+        return StorePath(p.filename().string());
     } catch (Error &) {
         return {};
     }

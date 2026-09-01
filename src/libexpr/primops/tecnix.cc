@@ -166,6 +166,9 @@ struct TecnixArgs
     Value * resolverArgs = nullptr;
     std::string argsKey;
     std::vector<std::string> targets;
+    /** The caller asked for the tracked source closure (`includeDependencies`),
+        so it must be computed even when the eval cache would not need it. */
+    bool requireDependencies = false;
 };
 
 /** The persistent-cache row family these arguments address. */
@@ -343,6 +346,26 @@ static void configureTecnixRepoContext(EvalState & state, const TecnixArgs & arg
 }
 
 /**
+ * Whether source-access tracking should run at all.
+ *
+ * Tracking exists to compute the dependency closure. That closure has exactly
+ * two consumers: the eval cache, which keys rows on it, and an explicit
+ * `includeDependencies` request, which returns it. With neither, tracking
+ * every force, interning the sets and fingerprinting the paths is pure
+ * overhead. Gating here also makes "not tracking" a whole-evaluation property,
+ * which is what lets the resolver module be shared in that mode.
+ */
+static bool tecnixSourceTrackingEnabled(const EvalState & state, const TecnixArgs & tArgs)
+{
+    return tArgs.requireDependencies || (state.settings.pureEval && state.settings.tecnixEvalCache);
+}
+
+/** Keyspace separator for modules built without tracking; see
+    getTecnixModuleValue. The embedded NUL keeps it disjoint from any resolver
+    path, which cannot contain one. */
+static constexpr std::string_view untrackedTecnixModuleKeyPrefix{"untracked\0", 10};
+
+/**
  * Import the explicit resolver file from the git repo and return a value from
  * the attrset produced by calling it with `args` (e.g. `resolve` or
  * `allTargetNames`).
@@ -352,20 +375,92 @@ static void configureTecnixRepoContext(EvalState & state, const TecnixArgs & arg
 static Value &
 getTecnixModuleValue(EvalState & state, const PosIdx pos, const TecnixArgs & tArgs, std::string_view attrName)
 {
-    // Get resolver file path from the lazily-mounted Tecnix repo accessor.
-    auto resolverPath = getTecnixRepoPath(state, tArgs.resolver);
-    auto modulePath = SourcePath(state.rootFS, CanonPath(resolverPath));
-
-    // Import the resolver file (a function taking the opaque `args` value) and call it.
-    auto * moduleFn = state.allocValue();
-    state.evalFile(modulePath, *moduleFn);
-
     if (!tArgs.resolverArgs)
         state.error<EvalError>("missing Tecnix resolver args").atPos(pos).debugThrow();
 
-    auto * moduleVal = state.allocValue();
-    state.callFunction(*moduleFn, *tArgs.resolverArgs, *moduleVal, pos);
-    state.forceAttrs(*moduleVal, pos, "while evaluating tecnix module");
+    auto buildModule = [&]() -> Value * {
+        // Get resolver file path from the lazily-mounted Tecnix repo accessor.
+        auto resolverPath = getTecnixRepoPath(state, tArgs.resolver);
+        auto modulePath = SourcePath(state.rootFS, CanonPath(resolverPath));
+
+        // Import the resolver file (a function taking the opaque `args` value) and call it.
+        auto * moduleFn = state.allocValue();
+        state.evalFile(modulePath, *moduleFn);
+
+        auto * moduleVal = state.allocValue();
+        state.callFunction(*moduleFn, *tArgs.resolverArgs, *moduleVal, pos);
+        state.forceAttrs(*moduleVal, pos, "while evaluating tecnix module");
+        return moduleVal;
+    };
+
+    auto * trackingCtx = currentTecnixThreadState.trackingContext;
+
+    Value * moduleVal = nullptr;
+
+    if (!trackingCtx && tecnixSourceTrackingEnabled(state, tArgs)) {
+        /* Tracking is enabled for this evaluation but this particular build is
+           untracked, so it has no label to replay. Caching it would let a later
+           tracked caller reuse a module whose accesses were never recorded. */
+        moduleVal = buildModule();
+    } else if (!trackingCtx) {
+        /* This call does not track, so the module it builds carries no label.
+           Share it only with other untracked calls: tracking is decided per
+           call (`includeDependencies` turns it on with the cache off), so a
+           tracked call later in the same evaluation must not inherit a module
+           whose accesses were never recorded -- it would silently drop the
+           resolver's own files from every target's closure. Hence the separate
+           keyspace rather than a shared entry. */
+        auto & moduleCache = *state.tecnixEvalData().tecnixModuleCache;
+        auto cacheKey = std::string(untrackedTecnixModuleKeyPrefix) + tArgs.resolver + '\0' + tArgs.argsKey;
+        moduleCache.try_emplace_and_cvisit(
+            cacheKey,
+            EvalTecnixModuleCacheEntry{},
+            [&](auto & i) {
+                moduleVal = buildModule();
+                i.second.value = RootValue(moduleVal);
+                i.second.sourceDeps = emptyEvalSourceAccessSetId;
+            },
+            [&](auto & i) { moduleVal = *i.second.value; });
+    } else {
+        /* Reuse the applied module for this (resolver, args) pair. Without this
+           every builtin re-applies the resolver and gets a fresh, wholly
+           unevaluated attrset, so discovering target names and then resolving
+           them walks the zone graph twice over. */
+        auto & moduleCache = *state.tecnixEvalData().tecnixModuleCache;
+        auto cacheKey = tArgs.resolver + '\0' + tArgs.argsKey;
+
+        auto sourceDeps = emptyEvalSourceAccessSetId;
+        bool hit = false;
+        moduleCache.cvisit(cacheKey, [&](auto & i) {
+            moduleVal = *i.second.value;
+            sourceDeps = i.second.sourceDeps;
+            hit = true;
+        });
+
+        if (!hit) {
+            /* Scope the build so the accesses it makes — importing the resolver
+               above all — are interned into one set that later contexts can
+               replay, instead of only landing in whichever frame happened to be
+               current the first time. */
+            TrackedSourceDepsScope moduleScope(*trackingCtx);
+            moduleVal = buildModule();
+            sourceDeps = moduleScope.finish(moduleVal);
+
+            moduleCache.try_emplace_and_cvisit(
+                cacheKey,
+                EvalTecnixModuleCacheEntry{},
+                [&](auto & i) {
+                    i.second.value = RootValue(moduleVal);
+                    i.second.sourceDeps = sourceDeps;
+                },
+                [&](auto & i) {
+                    moduleVal = *i.second.value;
+                    sourceDeps = i.second.sourceDeps;
+                });
+        } else {
+            recordTrackedSourceAccessSetDependency(*trackingCtx, sourceDeps);
+        }
+    }
 
     auto attr = moduleVal->attrs()->get(state.symbols.create(attrName));
     if (!attr)
@@ -392,10 +487,10 @@ static SourceAccessSetSnapshot snapshotSourceAccessSetTracking(const TrackingCon
     // Tracking contexts are thread-confined: the snapshot runs on the thread
     // that owns the context, after its evaluation has completed.
     SourceAccessSetSnapshot snapshot;
-    snapshot.directAccesses.assign(
-        ctx.rootFrame.directSourceAccessSetAccesses.begin(), ctx.rootFrame.directSourceAccessSetAccesses.end());
-    snapshot.accessSetEdges.assign(
-        ctx.rootFrame.childSourceAccessSets.begin(), ctx.rootFrame.childSourceAccessSets.end());
+    auto rootAccesses = ctx.rootFrame.directSourceAccessSetAccesses();
+    auto rootChildren = ctx.rootFrame.childSourceAccessSets();
+    snapshot.directAccesses.assign(rootAccesses.begin(), rootAccesses.end());
+    snapshot.accessSetEdges.assign(rootChildren.begin(), rootChildren.end());
     return snapshot;
 }
 
@@ -461,6 +556,7 @@ static TecnixDiscoveryResult discoverTecnixTargetNames(
     EvalState & state, const PosIdx pos, const TecnixArgs & tArgs, DependencyFingerprintCache & fingerprintCache)
 {
     bool useCache = state.settings.pureEval && state.settings.tecnixEvalCache;
+    bool track = tecnixSourceTrackingEnabled(state, tArgs);
 
     std::string cacheKey{tecnixTargetNamesCacheKey};
     if (useCache) {
@@ -480,14 +576,20 @@ static TecnixDiscoveryResult discoverTecnixTargetNames(
     }
 
     printTalkative("tecnixTargetNames: discovery cache miss, evaluating");
-    TrackingContext trackingCtx(state);
+    std::optional<TrackingContext> trackingCtx;
     std::vector<std::string> targetNames;
-    {
-        ActiveTrackingContext activeTrackingCtx(trackingCtx);
+    if (track) {
+        trackingCtx.emplace(state);
+        ActiveTrackingContext activeTrackingCtx(*trackingCtx);
+        targetNames = evalTargetNamesOnly(state, pos, tArgs);
+    } else {
         targetNames = evalTargetNamesOnly(state, pos, tArgs);
     }
-    auto trackedPaths = collectSourceAccessSetTrackedPaths(trackingCtx);
-    auto dependencies = dependencyFingerprints(getTecnixRepoAccessor(state), trackedPaths, fingerprintCache);
+    DependencyClosure dependencies;
+    if (trackingCtx) {
+        auto trackedPaths = collectSourceAccessSetTrackedPaths(*trackingCtx);
+        dependencies = dependencyFingerprints(getTecnixRepoAccessor(state), trackedPaths, fingerprintCache);
+    }
 
     if (useCache && !dependencies.empty()) {
         std::vector<TecnixDependencyUpsert> upserts;
@@ -601,6 +703,7 @@ static void prim_tecnixTargets(EvalState & state, const PosIdx pos, Value ** arg
         args,
         state.symbols.create("includeDependencies"),
         "while evaluating the 'includeDependencies' argument to builtins.tecnixTargets");
+    tArgs.requireDependencies = includeDependencies;
 
     if (includeDependencies) {
         auto includeTargets = getTecnixBoolAttr(
@@ -722,6 +825,12 @@ struct PreparedTrackedResolveFunction
 static PreparedTrackedResolveFunction
 prepareTrackedResolveFunction(EvalState & state, const PosIdx pos, const TecnixArgs & tArgs)
 {
+    if (!tecnixSourceTrackingEnabled(state, tArgs))
+        return {
+            .resolveFn = &getResolveFunction(state, pos, tArgs),
+            .sourceDeps = emptyEvalSourceAccessSetId,
+        };
+
     TrackingContext trackingCtx(state);
     ActiveTrackingContext activeTrackingCtx(trackingCtx);
 
@@ -741,7 +850,8 @@ static TargetDependencyResult evalTargetDependencies(
     Value & resolveFn,
     EvalSourceAccessSetId resolveSourceDeps,
     const std::string & target,
-    bool keepTargetValue)
+    bool keepTargetValue,
+    bool track)
 {
     auto started = std::chrono::steady_clock::now();
     printTalkative(
@@ -749,13 +859,18 @@ static TargetDependencyResult evalTargetDependencies(
         target,
         Executor::amWorkerThread ? "worker" : "main");
 
-    TrackingContext trackingCtx(state);
-    if (resolveSourceDeps != emptyEvalSourceAccessSetId)
-        recordTrackedSourceAccessSetDependency(trackingCtx, resolveSourceDeps);
+    std::optional<TrackingContext> trackingCtx;
+    if (track) {
+        trackingCtx.emplace(state);
+        if (resolveSourceDeps != emptyEvalSourceAccessSetId)
+            recordTrackedSourceAccessSetDependency(*trackingCtx, resolveSourceDeps);
+    }
     Value * targetValue = nullptr;
     std::string drvPath;
     {
-        ActiveTrackingContext activeTrackingCtx(trackingCtx);
+        std::optional<ActiveTrackingContext> activeTrackingCtx;
+        if (trackingCtx)
+            activeTrackingCtx.emplace(*trackingCtx);
 
         auto * targetArg = state.allocValue();
         targetArg->mkString(target, state.mem);
@@ -766,7 +881,9 @@ static TargetDependencyResult evalTargetDependencies(
             targetValue = resolveResult;
     }
 
-    auto snapshot = snapshotSourceAccessSetTracking(trackingCtx);
+    std::optional<SourceAccessSetSnapshot> snapshot;
+    if (trackingCtx)
+        snapshot = snapshotSourceAccessSetTracking(*trackingCtx);
     auto elapsedMs =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
     printTalkative(
@@ -910,7 +1027,13 @@ static TargetDependencyResults evaluateTecnixTargetDependencies(
         auto evalMiss = [&](size_t i) {
             auto & target = args.targets[i];
             results[i] = evalTargetDependencies(
-                state, pos, *preparedResolve.resolveFn, preparedResolve.sourceDeps, target, keepTargetValues);
+                state,
+                pos,
+                *preparedResolve.resolveFn,
+                preparedResolve.sourceDeps,
+                target,
+                keepTargetValues,
+                tecnixSourceTrackingEnabled(state, args));
             if (results[i])
                 results[i]->cacheNeedsUpsert = true;
         };
@@ -1035,6 +1158,7 @@ static void prim_tecnixTargetNames(EvalState & state, const PosIdx pos, Value **
         args,
         state.symbols.create("includeDependencies"),
         "while evaluating the 'includeDependencies' argument to builtins.tecnixTargetNames");
+    dArgs.requireDependencies = includeDependencies;
 
     DependencyFingerprintCache fingerprintCache;
     auto result = discoverTecnixTargetNames(state, pos, dArgs, fingerprintCache);
