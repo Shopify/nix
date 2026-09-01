@@ -36,6 +36,16 @@ void prim_importNative(EvalState & state, const PosIdx pos, Value ** args, Value
  */
 void prim_exec(EvalState & state, const PosIdx pos, Value ** args, Value & v);
 
+/**
+ * Convert a store derivation (a `.drv` store path) into a derivation-shaped
+ * attrset value (`type`, `name`, `drvPath`, `outPath`, `outputs`, per-output
+ * attrs), as importing a `.drv` file does. `path` is the source path whose
+ * string form becomes the value's `drvPath`; `storePath` must name a valid
+ * store derivation.
+ */
+void derivationToValue(
+    EvalState & state, const PosIdx pos, const SourcePath & path, const StorePath & storePath, Value & v);
+
 void makePositionThunks(EvalState & state, const PosIdx pos, Value & line, Value & column);
 
 } // namespace nix

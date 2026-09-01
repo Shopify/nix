@@ -13,6 +13,7 @@
 #include "nix/expr/tecnix/access-set-graph.hh"
 #include "nix/expr/tecnix/eval-cache.hh"
 #include "nix/expr/tecnix/source-accessors.hh"
+#include "nix/store/store-api.hh"
 #include "nix/util/strings.hh"
 #include "nix/util/util.hh"
 
@@ -563,22 +564,30 @@ evalTecnixIndices(EvalState & state, const std::vector<size_t> & indices, EvalOn
         evalOne(i);
 }
 
-static void forceTargetDrvPath(EvalState & state, Value & targetValue, const PosIdx pos)
+/**
+ * Force the target value's `drvPath` attribute (on the miss path this is the
+ * force that learns the target's closure) and return the printed drv path,
+ * or "" when the value is not a derivation-shaped attrset.
+ */
+static std::string forceTargetDrvPath(EvalState & state, Value & targetValue, const PosIdx pos)
 {
     state.forceValue(targetValue, pos);
     if (targetValue.type() != nAttrs)
-        return;
+        return "";
 
     auto drvPathAttr = targetValue.attrs()->get(state.s.drvPath);
     if (!drvPathAttr)
-        return;
+        return "";
 
     NixStringContext context;
-    state.forceString(*drvPathAttr->value, context, pos, "while evaluating the 'drvPath' attribute of a tecnix target");
+    return std::string(state.forceString(
+        *drvPathAttr->value, context, pos, "while evaluating the 'drvPath' attribute of a tecnix target"));
 }
 
 static void prim_tecnixTargetsWithDependencies(
     EvalState & state, const PosIdx pos, Value ** args, Value & v, TecnixArgs && tArgs, bool includeTargets);
+
+static void prim_tecnixTargetsCached(EvalState & state, const PosIdx pos, Value & v, const TecnixArgs & tArgs);
 
 static void prim_tecnixTargets(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
@@ -602,6 +611,11 @@ static void prim_tecnixTargets(EvalState & state, const PosIdx pos, Value ** arg
             "while evaluating the 'includeTargets' argument to builtins.tecnixTargets",
             true);
         prim_tecnixTargetsWithDependencies(state, pos, args, v, std::move(tArgs), includeTargets);
+        return;
+    }
+
+    if (state.settings.pureEval && state.settings.tecnixEvalCache) {
+        prim_tecnixTargetsCached(state, pos, v, tArgs);
         return;
     }
 
@@ -663,6 +677,14 @@ static RegisterPrimOp primop_tecnixTargets({
       an ordered list of `{ target, value, dependencies }` records, where
       `dependencies` is an attrset of `path = fingerprint`. Add
       `includeTargets = false` to omit `value` from each record.
+
+      Under pure evaluation with `tecnix-eval-cache` enabled, a target whose
+      stored source closure still matches the current tree and whose cached
+      drvPath is still a valid store path is answered from the cache without
+      evaluation. Such cached values have the derivation shape produced by
+      importing the `.drv` (`type`, `name`, `drvPath`, `outPath`, `outputs`,
+      per-output attrs); resolver attributes outside that contract are not
+      preserved on a value-cache hit.
     )",
     .impl = prim_tecnixTargets,
 });
@@ -673,6 +695,13 @@ struct TargetDependencyResult
     std::optional<ValidatedDependencyBlob> dependencyBlob;
     std::optional<SourceAccessSetSnapshot> sourceAccessSetSnapshot;
     Value * targetValue = nullptr;
+    /** Hit: the candidate's payload drv, verified present in the store, that
+        the target value is served from. */
+    std::optional<StorePath> cachedDrvPath;
+    /** Miss: printed drv path produced by evaluating the target, stored as
+        the candidate's payload so later proven hits can skip evaluation;
+        empty when the target value exposed no drvPath. */
+    std::string drvPath;
     bool cacheNeedsUpsert = false;
 };
 
@@ -724,6 +753,7 @@ static TargetDependencyResult evalTargetDependencies(
     if (resolveSourceDeps != emptyEvalSourceAccessSetId)
         recordTrackedSourceAccessSetDependency(trackingCtx, resolveSourceDeps);
     Value * targetValue = nullptr;
+    std::string drvPath;
     {
         ActiveTrackingContext activeTrackingCtx(trackingCtx);
 
@@ -731,7 +761,7 @@ static TargetDependencyResult evalTargetDependencies(
         targetArg->mkString(target, state.mem);
         auto * resolveResult = state.allocValue();
         state.callFunction(resolveFn, *targetArg, *resolveResult, pos);
-        forceTargetDrvPath(state, *resolveResult, pos);
+        drvPath = forceTargetDrvPath(state, *resolveResult, pos);
         if (keepTargetValue)
             targetValue = resolveResult;
     }
@@ -745,6 +775,7 @@ static TargetDependencyResult evalTargetDependencies(
         .dependencies = {},
         .sourceAccessSetSnapshot = std::move(snapshot),
         .targetValue = targetValue,
+        .drvPath = std::move(drvPath),
     };
 }
 
@@ -777,6 +808,39 @@ static void printTecnixAccessSetStats(EvalState & state, std::string_view opName
         sourceAccessSetStats.accessSetItems);
 }
 
+/**
+ * For each cache hit, the drv named by its candidate payload, when that
+ * payload is a drv store path still present in the store — the extra proof a
+ * hit needs before it may serve a target value without evaluation.
+ */
+static std::vector<std::optional<StorePath>>
+lookupCachedTargetDrvs(EvalState & state, const std::vector<std::optional<ValidatedDependencyBlob>> & hits)
+{
+    std::vector<std::optional<StorePath>> drvs(hits.size());
+    StorePathSet candidates;
+    for (size_t i = 0; i < hits.size(); i++) {
+        if (!hits[i])
+            continue;
+        auto payload = hits[i]->payload();
+        if (!payload || payload->empty())
+            continue;
+        auto storePath = state.store->maybeParseStorePath(*payload);
+        if (!storePath || !storePath->isDerivation())
+            continue;
+        candidates.insert(*storePath);
+        drvs[i] = std::move(storePath);
+    }
+    if (candidates.empty())
+        return drvs;
+
+    auto valid = state.store->queryValidPaths(candidates);
+    for (auto & drv : drvs) {
+        if (drv && !valid.count(*drv))
+            drv.reset();
+    }
+    return drvs;
+}
+
 static TargetDependencyResults evaluateTecnixTargetDependencies(
     EvalState & state,
     const PosIdx pos,
@@ -801,14 +865,28 @@ static TargetDependencyResults evaluateTecnixTargetDependencies(
             cacheScope(args),
             std::span<const std::string>{args.targets.data(), args.targets.size()},
             fingerprintCache);
+        // When target values are wanted, a hit must also prove its value:
+        // the payload drv must still be in the store. Anything else is an
+        // ordinary miss and is re-evaluated (which re-learns the payload).
+        std::vector<std::optional<StorePath>> cachedDrvs;
+        if (keepTargetValues)
+            cachedDrvs = lookupCachedTargetDrvs(state, hits);
         for (size_t i = 0; i < hits.size(); i++) {
             if (!hits[i]) {
                 printTalkative("tecnixTargets dependencies: dependency cache miss, evaluating '%s'", args.targets[i]);
                 continue;
             }
+            if (keepTargetValues && !cachedDrvs[i]) {
+                printTalkative(
+                    "tecnixTargets dependencies: dependency cache hit for '%s' has no valid target value, evaluating",
+                    args.targets[i]);
+                continue;
+            }
             printTalkative("tecnixTargets dependencies: dependency cache hit for '%s'", args.targets[i]);
             results[i].emplace();
             results[i]->dependencyBlob = std::move(hits[i]);
+            if (keepTargetValues)
+                results[i]->cachedDrvPath = std::move(cachedDrvs[i]);
             cacheHits++;
         }
     }
@@ -845,13 +923,67 @@ static TargetDependencyResults evaluateTecnixTargetDependencies(
             upserts.reserve(misses.size());
             for (auto i : misses) {
                 if (results[i] && results[i]->cacheNeedsUpsert)
-                    upserts.push_back({args.targets[i], &results[i]->dependencies, {}});
+                    upserts.push_back({args.targets[i], &results[i]->dependencies, results[i]->drvPath});
             }
             upsertDependencyClosures(cacheScope(args), upserts);
         }
     }
 
     return results;
+}
+
+/**
+ * Fill in `targetValue` for every result that lacks one. A proven candidate
+ * whose payload carries a drvPath that is still a valid store path is a
+ * target-value cache hit: the value is rebuilt from the drv itself, exactly
+ * as `import <drvPath>` would, without calling the resolver. Everything else
+ * (no payload, malformed payload, or a garbage-collected drv) falls back to
+ * resolving the target again.
+ */
+/**
+ * Serve hit target values from their verified cached drvs, exactly as
+ * `import <drvPath>` would build them. Misses already carry the value their
+ * evaluation produced.
+ */
+static void materializeTargetValues(EvalState & state, const PosIdx pos, TargetDependencyResults & results)
+{
+    size_t valueHits = 0;
+    for (auto & maybeResult : results) {
+        assert(maybeResult);
+        auto & result = *maybeResult;
+        if (result.targetValue || !result.cachedDrvPath)
+            continue;
+        auto & drvPath = *result.cachedDrvPath;
+        auto * targetValue = state.allocValue();
+        derivationToValue(
+            state,
+            pos,
+            SourcePath(state.rootFS, CanonPath(state.store->printStorePath(drvPath))),
+            drvPath,
+            *targetValue);
+        result.targetValue = targetValue;
+        valueHits++;
+    }
+    if (valueHits)
+        printTalkative("tecnixTargets: %d target value(s) served from the cache", valueHits);
+}
+
+/**
+ * The cached form of plain `builtins.tecnixTargets`: prove stored source
+ * closures, answer proven targets from their cached drvPath payloads, and
+ * evaluate (and cache) the rest.
+ */
+static void prim_tecnixTargetsCached(EvalState & state, const PosIdx pos, Value & v, const TecnixArgs & tArgs)
+{
+    DependencyFingerprintCache fingerprintCache;
+    auto results = evaluateTecnixTargetDependencies(state, pos, tArgs, fingerprintCache, /*keepTargetValues=*/true);
+    printTecnixAccessSetStats(state, "tecnixTargets");
+    materializeTargetValues(state, pos, results);
+
+    auto rootAttrs = state.buildBindings(tArgs.targets.size());
+    for (size_t i = 0; i < tArgs.targets.size(); i++)
+        rootAttrs.insert(state.symbols.create(tArgs.targets[i]), results[i]->targetValue);
+    v.mkAttrs(rootAttrs);
 }
 
 static void prim_tecnixTargetsWithDependencies(
@@ -861,28 +993,8 @@ static void prim_tecnixTargetsWithDependencies(
     auto results = evaluateTecnixTargetDependencies(state, pos, tArgs, fingerprintCache, includeTargets);
     printTecnixAccessSetStats(state, "tecnixTargets");
 
-    if (includeTargets) {
-        std::vector<size_t> missingTargetValueIndices;
-        missingTargetValueIndices.reserve(tArgs.targets.size());
-        for (size_t i = 0; i < tArgs.targets.size(); i++) {
-            assert(results[i]);
-            if (!results[i]->targetValue)
-                missingTargetValueIndices.push_back(i);
-        }
-
-        if (!missingTargetValueIndices.empty()) {
-            auto & resolveFn = getResolveFunction(state, pos, tArgs);
-            auto evalTarget = [&](size_t i) {
-                auto * targetValue = state.allocValue();
-                auto * targetArg = state.allocValue();
-                targetArg->mkString(tArgs.targets[i], state.mem);
-                state.callFunction(resolveFn, *targetArg, *targetValue, pos);
-                forceTargetDrvPath(state, *targetValue, pos);
-                results[i]->targetValue = targetValue;
-            };
-            evalTecnixIndices(state, missingTargetValueIndices, evalTarget);
-        }
-    }
+    if (includeTargets)
+        materializeTargetValues(state, pos, results);
 
     auto list = state.buildList(tArgs.targets.size());
     for (size_t i = 0; i < tArgs.targets.size(); i++) {

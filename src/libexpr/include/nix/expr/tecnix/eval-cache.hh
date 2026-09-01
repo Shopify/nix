@@ -68,7 +68,8 @@ struct TecnixDependencyUpsert
 {
     std::string_view target;
     const DependencyClosure * dependencies;
-    /** Stored as the candidate's payload (e.g. discovery's target-name JSON); empty for none. */
+    /** Stored as the candidate's payload (discovery's target-name JSON, or a
+        target's evaluated drvPath); empty for none. */
     std::string payload;
 };
 
@@ -90,7 +91,8 @@ public:
     /** Dependency output (`path = fingerprint` attrs) built from the matched candidate's pair stream. */
     Value * toValue(EvalState & state) const;
 
-    /** The matched candidate's payload (e.g. discovery's target-name JSON), if any. */
+    /** The matched candidate's payload (discovery's target-name JSON, or a
+        target's evaluated drvPath), if any. */
     std::optional<std::string_view> payload() const;
 
 private:
