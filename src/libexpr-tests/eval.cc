@@ -3,6 +3,10 @@
 
 #include "nix/expr/eval.hh"
 #include "nix/expr/tests/libexpr.hh"
+#include "nix/expr/eval-cache.hh"
+#include "nix/store/async-path-writer.hh"
+#include "nix/store/local-store.hh"
+#include "nix/util/file-system.hh"
 #include "nix/util/memory-source-accessor.hh"
 
 namespace nix {
@@ -210,6 +214,111 @@ TEST_F(PureEvalTest, pathExists)
         state.allowPath(path); // FIXME: This shouldn't behave this way.
         ASSERT_THAT(eval("builtins.readDir /."), IsAttrsOfSize(0));
     }
+}
+
+namespace {
+
+struct DeferredPathWriter : AsyncPathWriter
+{
+    std::function<void()> write;
+
+    StorePath addPath(std::string, std::string, StorePathSet, RepairFlag, std::shared_ptr<const Provenance>) override
+    {
+        throw Error("unexpected addPath");
+    }
+
+    void waitForPath(const StorePath &) override
+    {
+        waitForAllPaths();
+    }
+
+    void waitForAllPaths() override
+    {
+        if (auto pending = std::exchange(write, {}))
+            pending();
+    }
+
+    bool wasAdded(const StorePath &) override
+    {
+        return false;
+    }
+};
+
+struct RacingPathInfoStore : LocalStore
+{
+    RacingPathInfoStore(ref<const LocalStoreConfig> config)
+        : Store(*config)
+        , LocalFSStore(*config)
+        , LocalStore(config)
+    {
+    }
+
+    std::function<void()> finishWrite;
+
+    bool isValidPathUncached(const StorePath & path) override
+    {
+        // TrackingStore uses the base implementation, which caches missing paths.
+        return Store::isValidPathUncached(path);
+    }
+
+    void queryPathInfoUncached(
+        const StorePath & path, Callback<std::shared_ptr<const ValidPathInfo>> callback) noexcept override
+    {
+        LocalStore::queryPathInfoUncached(path, {[this, &callback](auto result) {
+                                              try {
+                                                  auto info = result.get();
+                                                  // Complete the write after the lookup, but before its missing
+                                                  // result enters the cache. No threads or sleeps are needed.
+                                                  if (!info)
+                                                      if (auto pending = std::exchange(finishWrite, {}))
+                                                          pending();
+                                                  callback(std::move(info));
+                                              } catch (...) {
+                                                  callback.rethrow();
+                                              }
+                                          }});
+    }
+};
+
+} // namespace
+
+TEST_F(EvalStateTest, forceDerivationWaitsForPendingWrite)
+{
+    auto tmpDir = createTempDir();
+    AutoDelete cleanup(tmpDir);
+    auto config = make_ref<LocalStoreConfig>(tmpDir, StoreConfig::Params{});
+    auto racingStore = make_ref<RacingPathInfoStore>(config);
+    auto writer = make_ref<DeferredPathWriter>();
+    EvalState evalState({}, racingStore, fetchSettings, evalSettings, nullptr);
+    evalState.asyncPathWriter = writer;
+
+    const std::string contents =
+        R"(Derive([("out","/nix/store/0ngv9b0ck67hr29zy0zak64s3n77pncq-pending","","")],[],[],"dummy","/bin/sh",[],[]))";
+    auto path = racingStore->makeFixedOutputPathFromCA(
+        "pending.drv", TextInfo{.hash = hashString(HashAlgorithm::SHA256, contents), .references = {}});
+    writer->write = [&] {
+        StringSource source(contents);
+        racingStore->addToStoreFromDump(
+            source,
+            "pending.drv",
+            FileSerialisationMethod::Flat,
+            ContentAddressMethod::Raw::Text,
+            HashAlgorithm::SHA256,
+            {},
+            NoRepair,
+            nullptr);
+    };
+    racingStore->finishWrite = [&] { writer->waitForPath(path); };
+
+    auto value = evalState.allocValue();
+    evalState.eval(
+        evalState.parseExprFromString(
+            fmt("{ drvPath = \"%s\"; }", racingStore->printStorePath(path)), evalState.rootPath(CanonPath::root)),
+        *value);
+    auto cache = make_ref<eval_cache::EvalCache>(std::nullopt, evalState, [value] { return value; });
+
+    EXPECT_EQ(cache->getRoot()->forceDerivation(), path);
+    EXPECT_TRUE(racingStore->isValidPath(path));
 }
 
 } // namespace nix
