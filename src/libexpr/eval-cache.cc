@@ -779,17 +779,19 @@ StorePath AttrCursor::forceDerivation()
     auto aDrvPath = getAttr(root->state.s.drvPath);
     auto drvPath = root->state.store->parseStorePath(aDrvPath->getString());
     drvPath.requireDerivation();
-    // Evaluation may have queued this derivation. Do not let a concurrent
-    // validity lookup cache a missing path after the writer invalidates it.
-    root->state.waitForPath(drvPath);
-    if (!root->state.store->isValidPath(drvPath) && !settings.readOnlyMode) {
-        /* The eval cache contains 'drvPath', but the actual path has
-           been garbage-collected. So force it to be regenerated. */
-        aDrvPath->forceValue();
+    if (!settings.readOnlyMode) {
+        // Evaluation may have queued this derivation. Do not let a concurrent
+        // validity lookup cache a missing path after the writer invalidates it.
         root->state.waitForPath(drvPath);
-        if (!root->state.store->isValidPath(drvPath))
-            throw Error(
-                "don't know how to recreate store derivation '%s'!", root->state.store->printStorePath(drvPath));
+        if (!root->state.store->isValidPath(drvPath)) {
+            /* The eval cache contains 'drvPath', but the actual path has
+               been garbage-collected. So force it to be regenerated. */
+            aDrvPath->forceValue();
+            root->state.waitForPath(drvPath);
+            if (!root->state.store->isValidPath(drvPath))
+                throw Error(
+                    "don't know how to recreate store derivation '%s'!", root->state.store->printStorePath(drvPath));
+        }
     }
     return drvPath;
 }

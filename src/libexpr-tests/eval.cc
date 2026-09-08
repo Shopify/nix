@@ -7,6 +7,7 @@
 #include "nix/store/async-path-writer.hh"
 #include "nix/store/local-store.hh"
 #include "nix/util/file-system.hh"
+#include "nix/util/finally.hh"
 #include "nix/util/memory-source-accessor.hh"
 
 namespace nix {
@@ -319,6 +320,24 @@ TEST_F(EvalStateTest, forceDerivationWaitsForPendingWrite)
 
     EXPECT_EQ(cache->getRoot()->forceDerivation(), path);
     EXPECT_TRUE(racingStore->isValidPath(path));
+}
+
+TEST_F(EvalStateTest, forceDerivationReadOnlySkipsPendingWrite)
+{
+    auto previousReadOnlyMode = std::exchange(settings.readOnlyMode, true);
+    Finally restoreReadOnlyMode([&] { settings.readOnlyMode = previousReadOnlyMode; });
+    auto writer = make_ref<DeferredPathWriter>();
+    state.asyncPathWriter = writer;
+    writer->write = [] { ADD_FAILURE() << "read-only evaluation waited for a pending write"; };
+
+    auto value = state.allocValue();
+    *value = eval(R"({ drvPath = "/nix/store/0ngv9b0ck67hr29zy0zak64s3n77pncq-pending.drv"; })");
+    auto cache = make_ref<eval_cache::EvalCache>(std::nullopt, state, [value] { return value; });
+    auto path = state.store->parseStorePath("/nix/store/0ngv9b0ck67hr29zy0zak64s3n77pncq-pending.drv");
+
+    EXPECT_EQ(cache->getRoot()->forceDerivation(), path);
+    EXPECT_TRUE(writer->write);
+    writer->write = {};
 }
 
 } // namespace nix
